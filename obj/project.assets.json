@@ -2040,11 +2040,11 @@
   "project": {
     "version": "1.0.0",
     "restore": {
-      "projectUniqueName": "D:\\Pedro\\Proyectos\\Bolsapel\\Zancaner\\ZancanerBackendV2\\BackendV2.csproj",
+      "projectUniqueName": "D:\\Pedro\\Proyectos\\Bolsapel\\Zancaner\\ZancanerBackendV2\\ZancanerBackendV2\\BackendV2.csproj",
       "projectName": "BackendV2",
-      "projectPath": "D:\\Pedro\\Proyectos\\Bolsapel\\Zancaner\\ZancanerBackendV2\\BackendV2.csproj",
+      "projectPath": "D:\\Pedro\\Proyectos\\Bolsapel\\Zancaner\\ZancanerBackendV2\\ZancanerBackendV2\\BackendV2.csproj",
       "packagesPath": "C:\\Users\\pir19\\.nuget\\packages\\",
-      "outputPath": "D:\\Pedro\\Proyectos\\Bolsapel\\Zancaner\\ZancanerBackendV2\\obj\\",
+      "outputPath": "D:\\Pedro\\Proyectos\\Bolsapel\\Zancaner\\ZancanerBackendV2\\ZancanerBackendV2\\obj\\",
       "projectStyle": "PackageReference",
       "fallbackFolders": [
         "C:\\Program Files (x86)\\Microsoft Visual Studio\\Shared\\NuGetPackages"
