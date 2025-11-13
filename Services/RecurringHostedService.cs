@@ -132,28 +132,98 @@ namespace BackendV2.Services
                             var jsonOptions = new JsonSerializerOptions { PropertyNamingPolicy = null, WriteIndented = false };
                             var json = JsonSerializer.Serialize(payload, jsonOptions);
 
-                            using var content = new StringContent(json);
-                            content.Headers.ContentType = new MediaTypeHeaderValue("application/json");
+                            // Build a CURL command representation for debugging / bitacora
+                            var curlBody = json.Replace("'", "\\'");
+                            var curlCommand = $"curl -X 'POST' '{externalEndpoint}' -H 'accept: application/json' -H 'Content-Type: application/json' -d '{curlBody}'";
+                            _logger.LogInformation("Outgoing CURL: {Curl}", curlCommand);
+
+                             using var content = new StringContent(json);
+                             content.Headers.ContentType = new MediaTypeHeaderValue("application/json");
 
                             HttpResponseMessage? response = null;
                             var sendSuccess = false;
+                            string errorMsg = string.Empty;
 
                             try
                             {
                                 response = await client.PostAsync(externalEndpoint, content, stoppingToken);
                                 if (response.IsSuccessStatusCode)
                                 {
-                                    sendSuccess = true;
-                                    _logger.LogInformation("Successfully sent order {Order} (messageId={MessageId})", productionOrderStr, messageId);
+                                    // Read response body to detect logical errors even when HTTP 200
+                                    var respText = await response.Content.ReadAsStringAsync(stoppingToken);
+                                    if (!string.IsNullOrWhiteSpace(respText))
+                                    {
+                                        try
+                                        {
+                                            using var doc = JsonDocument.Parse(respText);
+                                            if (doc.RootElement.TryGetProperty("result", out var resultEl) && resultEl.GetString() == "ERROR")
+                                            {
+                                                // Extract messages array if present and persist as errorMsg
+                                                if (doc.RootElement.TryGetProperty("messages", out var messagesEl) && messagesEl.ValueKind == JsonValueKind.Array)
+                                                {
+                                                    var msgs = new List<string>();
+                                                    foreach (var m in messagesEl.EnumerateArray())
+                                                    {
+                                                        if (m.ValueKind == JsonValueKind.String)
+                                                        {
+                                                            var t = m.GetString();
+                                                            if (!string.IsNullOrWhiteSpace(t)) msgs.Add(t.Trim());
+                                                        }
+                                                    }
+
+                                                    if (msgs.Count > 0)
+                                                    {
+                                                        errorMsg = string.Join(" | ", msgs);
+                                                        sendSuccess = false;
+                                                        _logger.LogWarning("External API returned logical ERROR for order {Order}: {ErrorMsg}", productionOrderStr, errorMsg);
+                                                    }
+                                                    else
+                                                    {
+                                                        // No messages array content
+                                                        errorMsg = respText;
+                                                        sendSuccess = false;
+                                                        _logger.LogWarning("External API returned logical ERROR for order {Order}. Response: {Response}", productionOrderStr, respText);
+                                                    }
+                                                }
+                                                else
+                                                {
+                                                    // result==ERROR but no messages array
+                                                    errorMsg = respText;
+                                                    sendSuccess = false;
+                                                    _logger.LogWarning("External API returned logical ERROR for order {Order}. Response: {Response}", productionOrderStr, respText);
+                                                }
+
+                                                // do not treat as HTTP success for downstream
+                                            }
+                                            else
+                                            {
+                                                sendSuccess = true;
+                                                _logger.LogInformation("Successfully sent order {Order} (messageId={MessageId})", productionOrderStr, messageId);
+                                            }
+                                        }
+                                        catch (JsonException jex)
+                                        {
+                                            // Unable to parse JSON, treat as success but keep raw response if any
+                                            sendSuccess = true;
+                                            _logger.LogInformation(jex, "Sent order {Order} but failed to parse response JSON", productionOrderStr);
+                                        }
+                                    }
+                                    else
+                                    {
+                                        sendSuccess = true;
+                                        _logger.LogInformation("Successfully sent order {Order} (messageId={MessageId})", productionOrderStr, messageId);
+                                    }
                                 }
                                 else
                                 {
                                     var respText = await response.Content.ReadAsStringAsync(stoppingToken);
+                                    errorMsg = respText;
                                     _logger.LogError("Failed to send order {Order}. StatusCode: {StatusCode}. Response: {Response}", productionOrderStr, response.StatusCode, respText);
                                 }
                             }
                             catch (Exception ex)
                             {
+                                errorMsg = ex.ToString();
                                 _logger.LogError(ex, "Exception while sending order {Order}", productionOrderStr);
                             }
                             finally
@@ -170,7 +240,9 @@ namespace BackendV2.Services
                                 if (dbLog != null)
                                 {
                                     var paramText = $"Production_Order={productionOrderStr}";
-                                    await dbLog.LogAsync(0, "RECURRING_SERVICE_SEND", paramText, Guid.Parse(messageId), string.Empty);
+                                    // If there was no error message, persist the curl command so we can reproduce the request
+                                    if (string.IsNullOrWhiteSpace(errorMsg)) errorMsg = curlCommand;
+                                    await dbLog.LogAsync(0, "RECURRING_SERVICE_SEND", paramText, Guid.Parse(messageId), errorMsg ?? string.Empty);
                                 }
                                 else
                                 {
@@ -179,6 +251,17 @@ namespace BackendV2.Services
                             }
                             catch (Exception dbLogEx)
                             {
+                                // Append DB log exception to errorMsg so it can be persisted or inspected
+                                try
+                                {
+                                    var dbErr = dbLogEx.ToString();
+                                    if (string.IsNullOrWhiteSpace(errorMsg)) errorMsg = dbErr; else errorMsg = errorMsg + " | DBLOG_ERROR: " + dbErr;
+                                }
+                                catch
+                                {
+                                    // ignore any failure when appending
+                                }
+
                                 _logger.LogWarning(dbLogEx, "Failed to write RECURRING_SERVICE_SEND to DB log for order {Order}", productionOrderStr);
                             }
 

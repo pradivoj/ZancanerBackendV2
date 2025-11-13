@@ -6,6 +6,17 @@ var builder = WebApplication.CreateBuilder(args);
 // Add services to the container.
 builder.Services.AddControllers();
 
+// Add CORS policy to allow Swagger UI to call the API during development
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy("AllowAll", policy =>
+    {
+        policy.AllowAnyOrigin()
+              .AllowAnyHeader()
+              .AllowAnyMethod();
+    });
+});
+
 // Register DbLogService and IDbLogService
 builder.Services.AddScoped<IDbLogService, DbLogService>();
 
@@ -36,6 +47,10 @@ if (app.Environment.IsDevelopment())
 }
 
 app.UseHttpsRedirection();
+
+// Enable CORS
+app.UseCors("AllowAll");
+
 app.UseAuthorization();
 app.MapControllers();
 app.Run();

@@ -5,6 +5,9 @@ using Microsoft.Data.SqlClient;
 using BackendV2.DTOs;
 using BackendV2.Services;
 using Microsoft.Extensions.Logging;
+using System.Net.Http.Headers;
+using System.Text;
+using System.Text.Json;
 
 namespace BackendV2.Controllers
 {
@@ -15,12 +18,14 @@ namespace BackendV2.Controllers
         private readonly IConfiguration _configuration;
         private readonly IDbLogService _dbLog;
         private readonly ILogger<OrdenesController> _logger;
+        private readonly IHttpClientFactory _httpClientFactory;
 
-        public OrdenesController(IConfiguration configuration, IDbLogService dbLog, ILogger<OrdenesController> logger)
+        public OrdenesController(IConfiguration configuration, IDbLogService dbLog, ILogger<OrdenesController> logger, IHttpClientFactory httpClientFactory)
         {
             _configuration = configuration;
             _dbLog = dbLog;
             _logger = logger;
+            _httpClientFactory = httpClientFactory;
         }
 
         // GET api/ordenes
@@ -228,7 +233,7 @@ namespace BackendV2.Controllers
                     CommandType = CommandType.StoredProcedure
                 };
 
-                cmd.Parameters.AddWithValue("@ProductionOrder", productionOrder);
+                cmd.Parameters.AddWithValue("@ORDER", productionOrder);
 
                 await conn.OpenAsync();
                 await using var reader = await cmd.ExecuteReaderAsync();
@@ -292,25 +297,200 @@ namespace BackendV2.Controllers
             var cs = _configuration.GetConnectionString("DefaultConnection");
             if (string.IsNullOrWhiteSpace(cs)) return StatusCode(500, "Connection string not configured.");
 
+            // correlation/messageId will be fetched from DB
+            string? messageId = null;
+            int statusValue = 0;
+
             try
             {
-                await using var conn = new SqlConnection(cs);
-                await using var cmd = new SqlCommand("CSP_ZANCANER_ORDERS_DELETE_ORDER", conn)
+                // First, get the record (and its correlation/messageId and STATUS) using existing SP
+                await using (var conn = new SqlConnection(cs))
+                await using (var cmd = new SqlCommand("CSP_ZANCANER_ORDERS_GET_BY_ID", conn) { CommandType = CommandType.StoredProcedure })
                 {
-                    CommandType = CommandType.StoredProcedure
-                };
+                    cmd.Parameters.AddWithValue("@ORDER", productionOrder);
+                    await conn.OpenAsync();
+                    await using var reader = await cmd.ExecuteReaderAsync();
+                    if (!await reader.ReadAsync())
+                    {
+                        return NotFound("La orden seleccionada para eliminar no ha sido encontrada");
+                    }
 
-                cmd.Parameters.AddWithValue("@ORDER", productionOrder);
+                    // Extract STATUS if present
+                    try
+                    {
+                        var statusObj = reader["STATUS"];
+                        var statusStr = statusObj != DBNull.Value ? statusObj?.ToString() ?? string.Empty : string.Empty;
+                        if (!string.IsNullOrWhiteSpace(statusStr) && int.TryParse(statusStr, out var parsed)) statusValue = parsed;
+                    }
+                    catch
+                    {
+                        // ignore - default statusValue = 0
+                    }
 
-                await conn.OpenAsync();
-                var rows = await cmd.ExecuteNonQueryAsync();
+                    // If status indicates already deleted (>1000), return conflict with message
+                    if (statusValue > 1000)
+                    {
+                        return Conflict($"La orden {productionOrder} ya ha sido eliminada previamente. No es posible eliminar");
+                    }
 
-                if (rows == 0) return NotFound();
-                return NoContent();
+                    // Try to find a correlation/messageId column in the returned row
+                    for (int i = 0; i < reader.FieldCount; i++)
+                    {
+                        var colName = reader.GetName(i)?.ToLowerInvariant() ?? string.Empty;
+                        if (colName.Contains("correl") || colName.Contains("messageid") || colName.Contains("message_id") || colName.Contains("message"))
+                        {
+                            var val = reader.IsDBNull(i) ? null : reader.GetValue(i)?.ToString();
+                            if (!string.IsNullOrWhiteSpace(val))
+                            {
+                                messageId = val;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // If no messageId returned, generate one
+                if (string.IsNullOrWhiteSpace(messageId)) messageId = Guid.NewGuid().ToString();
+
+                // Decide whether to call external API depending on STATUS
+                var shouldCallExternal = statusValue >= 900 && statusValue <= 999;
+
+                if (shouldCallExternal)
+                {
+                    // Prepare payload for external DELETE API
+                    var payload = new
+                    {
+                        messageType = "DELETE_ORDER",
+                        messageId = messageId,
+                        productionOrder = productionOrder.ToString()
+                    };
+
+                    var json = JsonSerializer.Serialize(payload);
+
+                    var client = _httpClientFactory.CreateClient();
+                    var request = new HttpRequestMessage(HttpMethod.Delete, "http://93.41.138.207:88/ZncWebApi/ProductionOrder/DeleteOrder")
+                    {
+                        Content = new StringContent(json, Encoding.UTF8, "application/json")
+                    };
+                    request.Headers.Accept.Clear();
+                    request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+
+                    HttpResponseMessage? response = null;
+                    try
+                    {
+                        response = await client.SendAsync(request);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Error calling external delete API for order {Order}", productionOrder);
+                        // Log failure to bitacora and return 502
+                        try
+                        {
+                            await _dbLog.LogAsync(0, "DELETE_ORDER_EXTERNAL", $"Production_Order={productionOrder}", Guid.TryParse(messageId, out var g) ? g : Guid.NewGuid(), ex.ToString());
+                        }
+                        catch (Exception logEx)
+                        {
+                            _logger.LogError(logEx, "Failed to write error to DB bitacora from Delete external call");
+                        }
+
+                        return StatusCode(502, $"Failed to call external delete API: {ex.Message}");
+                    }
+
+                    using (response)
+                    {
+                        if (!response.IsSuccessStatusCode)
+                        {
+                            var respText = await response.Content.ReadAsStringAsync();
+                            _logger.LogError("External delete API returned status {Status} for order {Order}. Response: {Response}", response.StatusCode, productionOrder, respText);
+
+                            try
+                            {
+                                await _dbLog.LogAsync(0, "DELETE_ORDER_EXTERNAL", $"Production_Order={productionOrder}", Guid.TryParse(messageId, out var g) ? g : Guid.NewGuid(), $"ExternalStatus={response.StatusCode};Response={respText}");
+                            }
+                            catch (Exception logEx)
+                            {
+                                _logger.LogError(logEx, "Failed to write error to DB bitacora from Delete external failure");
+                            }
+
+                            // If external returned 404 with JSON containing a 'messages' array, try to extract the "ERROR => ..." entry and return it
+                            if (response.StatusCode == System.Net.HttpStatusCode.NotFound)
+                            {
+                                try
+                                {
+                                    using var doc = JsonDocument.Parse(respText);
+                                    if (doc.RootElement.TryGetProperty("messages", out var messagesEl) && messagesEl.ValueKind == JsonValueKind.Array)
+                                    {
+                                        foreach (var m in messagesEl.EnumerateArray())
+                                        {
+                                            if (m.ValueKind == JsonValueKind.String)
+                                            {
+                                                var txt = m.GetString();
+                                                if (!string.IsNullOrWhiteSpace(txt) && txt.Contains("ERROR =>"))
+                                                {
+                                                    // Return the specific error message from external API, prefixed with ZANCANER
+                                                    return NotFound($"ZANCANER {txt}");
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                catch (Exception parseEx)
+                                {
+                                    _logger.LogWarning(parseEx, "Failed to parse external 404 response JSON for order {Order}", productionOrder);
+                                }
+
+                                // Fallback: return full response text with 404
+                                return NotFound(respText);
+                            }
+
+                            return StatusCode(502, $"External delete failed: {response.StatusCode}");
+                        }
+                    }
+
+                    // If external succeeded, proceed to local delete below
+                }
+
+                // Proceed to delete locally via SP (either because external succeeded or because STATUS < 900)
+                try
+                {
+                    await using var conn2 = new SqlConnection(cs);
+                    await using var cmd2 = new SqlCommand("CSP_ZANCANER_ORDERS_DELETE_ORDER", conn2) { CommandType = CommandType.StoredProcedure };
+                    cmd2.Parameters.AddWithValue("@ORDER", productionOrder);
+                    await conn2.OpenAsync();
+                    var rows = await cmd2.ExecuteNonQueryAsync();
+
+                    if (rows == 0) return NotFound();
+
+                    // Log success in bitácora
+                    try
+                    {
+                        await _dbLog.LogAsync(0, "DELETE_ORDER", $"Production_Order={productionOrder}", Guid.TryParse(messageId, out var g) ? g : Guid.NewGuid(), string.Empty);
+                    }
+                    catch (Exception logEx)
+                    {
+                        _logger.LogError(logEx, "Failed to write to DB bitacora from Delete");
+                    }
+
+                    return NoContent();
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error deleting order after external success or direct delete");
+                    try
+                    {
+                        await _dbLog.LogAsync(0, "DELETE_ORDER", $"Production_Order={productionOrder}", Guid.TryParse(messageId, out var g) ? g : Guid.NewGuid(), ex.ToString());
+                    }
+                    catch (Exception logEx)
+                    {
+                        _logger.LogError(logEx, "Failed to write error to DB bitacora from Delete (after external success)");
+                    }
+
+                    return StatusCode(500, $"Error deleting order: {ex.Message}");
+                }
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error deleting order");
+                _logger.LogError(ex, "Unhandled error in Delete for order {Order}", productionOrder);
                 return StatusCode(500, $"Error deleting order: {ex.Message}");
             }
         }
@@ -336,6 +516,217 @@ namespace BackendV2.Controllers
             {
                 _logger.LogError(ex, "Test log failed");
                 return StatusCode(500, $"Test log failed: {ex.Message}");
+            }
+        }
+
+        // POST -> Start order: prepares data, validates, calls external StartOrder and updates status
+        [HttpPost("start/{productionOrder}/{slitter}")]
+        public async Task<IActionResult> StartOrder(int productionOrder, int slitter)
+        {
+            var cs = _configuration.GetConnectionString("DefaultConnection");
+            if (string.IsNullOrWhiteSpace(cs)) return StatusCode(500, "Connection string not configured.");
+
+            string? messageId = null;
+            int statusValue = 0;
+
+            try
+            {
+                // 0) Ensure order exists by calling CSP_ZANCANER_ORDERS_GET_BY_ID (@ORDER)
+                try
+                {
+                    await using var existConn = new SqlConnection(cs);
+                    await using var existCmd = new SqlCommand("CSP_ZANCANER_ORDERS_GET_BY_ID", existConn) { CommandType = CommandType.StoredProcedure };
+                    existCmd.Parameters.AddWithValue("@ORDER", productionOrder);
+                    await existConn.OpenAsync();
+                    await using var existReader = await existCmd.ExecuteReaderAsync();
+                    if (!await existReader.ReadAsync())
+                    {
+                        return NotFound("La orden de producción no fue encontrada");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error checking existence for order {Order}", productionOrder);
+                    return StatusCode(500, $"Error checking order existence: {ex.Message}");
+                }
+
+                // 1) Call CSP_ZANCANER_ORDERS_DETAILS_CREATE_ORDER_DATA (@order)
+                try
+                {
+                    await using var prepConn = new SqlConnection(cs);
+                    await using var prepCmd = new SqlCommand("CSP_ZANCANER_ORDERS_DETAILS_CREATE_ORDER_DATA", prepConn) { CommandType = CommandType.StoredProcedure };
+                    prepCmd.Parameters.AddWithValue("@PRODUCTION_ORDER", productionOrder);
+                    await prepConn.OpenAsync();
+                    await prepCmd.ExecuteNonQueryAsync();
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error executing CSP_ZANCANER_ORDERS_DETAILS_CREATE_ORDER_DATA for order {Order}", productionOrder);
+                    return StatusCode(500, $"Error preparing order data: {ex.Message}");
+                }
+
+                // 2) Call CSP_ZANCANER_ORDERS_VALIDA_DATOS_ORDEN_BY_ORDER (@order)
+                try
+                {
+                    await using var valConn = new SqlConnection(cs);
+                    await using var valCmd = new SqlCommand("CSP_ZANCANER_ORDERS_VALIDA_DATOS_ORDEN_BY_ORDER", valConn) { CommandType = CommandType.StoredProcedure };
+                    valCmd.Parameters.AddWithValue("@ORDER", productionOrder);
+                    await valConn.OpenAsync();
+                    await valCmd.ExecuteNonQueryAsync();
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error executing CSP_ZANCANER_ORDERS_VALIDA_DATOS_ORDEN_BY_ORDER for order {Order}", productionOrder);
+                    return StatusCode(500, $"Error validating order data: {ex.Message}");
+                }
+
+                // 3) Call CSP_ZANCANER_ORDERS_GET_BY_ID to retrieve STATUS and CorrelationId
+                await using (var conn = new SqlConnection(cs))
+                await using (var cmd = new SqlCommand("CSP_ZANCANER_ORDERS_GET_BY_ID", conn) { CommandType = CommandType.StoredProcedure })
+                {
+                    cmd.Parameters.AddWithValue("@ORDER", productionOrder);
+                    await conn.OpenAsync();
+                    await using var reader = await cmd.ExecuteReaderAsync();
+                    if (!await reader.ReadAsync())
+                    {
+                        return NotFound("La orden solicitada no ha sido encontrada");
+                    }
+
+                    // Extract STATUS
+                    try
+                    {
+                        var statusObj = reader["STATUS"];
+                        var statusStr = statusObj != DBNull.Value ? statusObj?.ToString() ?? string.Empty : string.Empty;
+                        if (!string.IsNullOrWhiteSpace(statusStr) && int.TryParse(statusStr, out var parsed)) statusValue = parsed;
+                    }
+                    catch { }
+
+                    // If status not in required range, return error
+                    if (!(statusValue >= 900 && statusValue <= 999))
+                    {
+                        return BadRequest("La orden no cumple el estado requerido para ser puesta en marcha.");
+                    }
+
+                    // find correlation/messageId
+                    for (int i = 0; i < reader.FieldCount; i++)
+                    {
+                        var colName = reader.GetName(i)?.ToLowerInvariant() ?? string.Empty;
+                        if (colName.Contains("correl") || colName.Contains("messageid") || colName.Contains("message_id") || colName.Contains("message"))
+                        {
+                            var val = reader.IsDBNull(i) ? null : reader.GetValue(i)?.ToString();
+                            if (!string.IsNullOrWhiteSpace(val))
+                            {
+                                messageId = val;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if (string.IsNullOrWhiteSpace(messageId)) messageId = Guid.NewGuid().ToString();
+
+                // 4) Call external StartOrder API
+                var payload = new
+                {
+                    messageType = "START_ORDER",
+                    messageId = messageId,
+                    productionOrder = productionOrder.ToString(),
+                    slitter = slitter
+                };
+
+                var json = JsonSerializer.Serialize(payload);
+                var client = _httpClientFactory.CreateClient();
+                var request = new HttpRequestMessage(HttpMethod.Post, "http://93.41.138.207:88/ZncWebApi/ProductionOrder/StartOrder")
+                {
+                    Content = new StringContent(json, Encoding.UTF8, "application/json")
+                };
+                request.Headers.Accept.Clear();
+                request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+
+                HttpResponseMessage? response = null;
+                try
+                {
+                    response = await client.SendAsync(request);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error calling external StartOrder API for order {Order}", productionOrder);
+                    // update status to 901 on external failure
+                    try
+                    {
+                        await using var updConnFail = new SqlConnection(cs);
+                        await using var updCmdFail = new SqlCommand("CSP_ZANCANER_ORDERS_UPDATE_STATUS_BY_ORDER", updConnFail) { CommandType = CommandType.StoredProcedure };
+                        updCmdFail.Parameters.AddWithValue("@NEW_STATUS", 901);
+                        updCmdFail.Parameters.AddWithValue("@ORDER", productionOrder);
+                        await updConnFail.OpenAsync();
+                        await updCmdFail.ExecuteNonQueryAsync();
+                    }
+                    catch (Exception logEx)
+                    {
+                        _logger.LogError(logEx, "Failed to update status to 901 after external StartOrder exception for order {Order}", productionOrder);
+                    }
+
+                    return StatusCode(502, $"Failed to call external StartOrder API: {ex.Message}");
+                }
+
+                using (response)
+                {
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        var respText = await response.Content.ReadAsStringAsync();
+                        _logger.LogError("External StartOrder API returned status {Status} for order {Order}. Response: {Response}", response.StatusCode, productionOrder, respText);
+
+                        // update status to 901 on external non-success
+                        try
+                        {
+                            await using var updConnFail = new SqlConnection(cs);
+                            await using var updCmdFail = new SqlCommand("CSP_ZANCANER_ORDERS_UPDATE_STATUS_BY_ORDER", updConnFail) { CommandType = CommandType.StoredProcedure };
+                            updCmdFail.Parameters.AddWithValue("@NEW_STATUS", 901);
+                            updCmdFail.Parameters.AddWithValue("@ORDER", productionOrder);
+                            await updConnFail.OpenAsync();
+                            await updCmdFail.ExecuteNonQueryAsync();
+                        }
+                        catch (Exception logEx)
+                        {
+                            _logger.LogError(logEx, "Failed to update status to 901 after external StartOrder failure for order {Order}", productionOrder);
+                        }
+
+                        return StatusCode(502, $"External StartOrder failed: {response.StatusCode}");
+                    }
+                }
+
+                // External returned success -> update local status to 1300
+                try
+                {
+                    await using var updConn = new SqlConnection(cs);
+                    await using var updCmd = new SqlCommand("CSP_ZANCANER_ORDERS_UPDATE_STATUS_BY_ORDER", updConn) { CommandType = CommandType.StoredProcedure };
+                    updCmd.Parameters.AddWithValue("@NEW_STATUS", 1300);
+                    updCmd.Parameters.AddWithValue("@ORDER", productionOrder);
+                    await updConn.OpenAsync();
+                    await updCmd.ExecuteNonQueryAsync();
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Failed to update status to 1300 after external StartOrder success for order {Order}", productionOrder);
+                    return StatusCode(500, $"Failed to update order status after external StartOrder: {ex.Message}");
+                }
+
+                // Log success in bitácora
+                try
+                {
+                    await _dbLog.LogAsync(0, "START_ORDER", $"Production_Order={productionOrder};Slitter={slitter}", Guid.TryParse(messageId, out var g) ? g : Guid.NewGuid(), string.Empty);
+                }
+                catch (Exception logEx)
+                {
+                    _logger.LogError(logEx, "Failed to write to DB bitacora from StartOrder for order {Order}", productionOrder);
+                }
+
+                return NoContent();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Unhandled error in StartOrder for order {Order}", productionOrder);
+                return StatusCode(500, $"Error starting order: {ex.Message}");
             }
         }
     }
