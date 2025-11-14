@@ -11,6 +11,8 @@ namespace BackendV2.Models
         public DateTime CreateDateTime { get; set; }
         public int LastModificatorUser { get; set; }
         public DateTime ModificationDatetime { get; set; }
+
+        public int StatusId { get; set; } 
         public string STATUS { get; set; } = string.Empty;
     }
 }

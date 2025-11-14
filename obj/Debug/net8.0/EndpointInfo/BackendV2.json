@@ -355,6 +355,10 @@
             "type": "string",
             "format": "date-time"
           },
+          "statusId": {
+            "type": "integer",
+            "format": "int32"
+          },
           "status": {
             "type": "string",
             "nullable": true

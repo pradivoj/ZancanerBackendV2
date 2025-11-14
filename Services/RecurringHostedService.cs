@@ -143,93 +143,145 @@ namespace BackendV2.Services
                             HttpResponseMessage? response = null;
                             var sendSuccess = false;
                             string errorMsg = string.Empty;
+                            bool skipSendBecauseExists = false;
 
-                            try
+                            // If we have a production order int, verify it does not already exist in external system
+                            if (productionOrderInt > 0)
                             {
-                                response = await client.PostAsync(externalEndpoint, content, stoppingToken);
-                                if (response.IsSuccessStatusCode)
+                                try
                                 {
-                                    // Read response body to detect logical errors even when HTTP 200
-                                    var respText = await response.Content.ReadAsStringAsync(stoppingToken);
-                                    if (!string.IsNullOrWhiteSpace(respText))
+                                    // compute GetOrder endpoint
+                                    string getEndpoint;
+                                    if (externalEndpoint.Contains("/ProductionOrder/CreateOrder"))
                                     {
-                                        try
-                                        {
-                                            using var doc = JsonDocument.Parse(respText);
-                                            if (doc.RootElement.TryGetProperty("result", out var resultEl) && resultEl.GetString() == "ERROR")
-                                            {
-                                                // Extract messages array if present and persist as errorMsg
-                                                if (doc.RootElement.TryGetProperty("messages", out var messagesEl) && messagesEl.ValueKind == JsonValueKind.Array)
-                                                {
-                                                    var msgs = new List<string>();
-                                                    foreach (var m in messagesEl.EnumerateArray())
-                                                    {
-                                                        if (m.ValueKind == JsonValueKind.String)
-                                                        {
-                                                            var t = m.GetString();
-                                                            if (!string.IsNullOrWhiteSpace(t)) msgs.Add(t.Trim());
-                                                        }
-                                                    }
-
-                                                    if (msgs.Count > 0)
-                                                    {
-                                                        errorMsg = string.Join(" | ", msgs);
-                                                        sendSuccess = false;
-                                                        _logger.LogWarning("External API returned logical ERROR for order {Order}: {ErrorMsg}", productionOrderStr, errorMsg);
-                                                    }
-                                                    else
-                                                    {
-                                                        // No messages array content
-                                                        errorMsg = respText;
-                                                        sendSuccess = false;
-                                                        _logger.LogWarning("External API returned logical ERROR for order {Order}. Response: {Response}", productionOrderStr, respText);
-                                                    }
-                                                }
-                                                else
-                                                {
-                                                    // result==ERROR but no messages array
-                                                    errorMsg = respText;
-                                                    sendSuccess = false;
-                                                    _logger.LogWarning("External API returned logical ERROR for order {Order}. Response: {Response}", productionOrderStr, respText);
-                                                }
-
-                                                // do not treat as HTTP success for downstream
-                                            }
-                                            else
-                                            {
-                                                sendSuccess = true;
-                                                _logger.LogInformation("Successfully sent order {Order} (messageId={MessageId})", productionOrderStr, messageId);
-                                            }
-                                        }
-                                        catch (JsonException jex)
-                                        {
-                                            // Unable to parse JSON, treat as success but keep raw response if any
-                                            sendSuccess = true;
-                                            _logger.LogInformation(jex, "Sent order {Order} but failed to parse response JSON", productionOrderStr);
-                                        }
+                                        getEndpoint = externalEndpoint.Replace("/ProductionOrder/CreateOrder", $"/ProductionOrder/GetOrder/{productionOrderInt}");
                                     }
                                     else
                                     {
-                                        sendSuccess = true;
-                                        _logger.LogInformation("Successfully sent order {Order} (messageId={MessageId})", productionOrderStr, messageId);
+                                        getEndpoint = externalEndpoint.TrimEnd('/') + $"/ProductionOrder/GetOrder/{productionOrderInt}";
                                     }
+
+                                    _logger.LogInformation("Checking external existence with GET {GetEndpoint}", getEndpoint);
+                                    var getResp = await client.GetAsync(getEndpoint, stoppingToken);
+                                    if (getResp.IsSuccessStatusCode)
+                                    {
+                                        // Order exists remotely, skip sending CreateOrder
+                                        skipSendBecauseExists = true;
+                                        errorMsg = "La order que desea crear ya existe en el ambiente de Zancaner";
+                                        _logger.LogWarning("External GetOrder returned 200 for order {Order}. Skipping create.", productionOrderInt);
+                                    }
+                                    else if (getResp.StatusCode == System.Net.HttpStatusCode.NotFound)
+                                    {
+                                        // not found -> proceed
+                                        _logger.LogDebug("External GetOrder returned 404 for order {Order}. Proceeding to create.", productionOrderInt);
+                                    }
+                                    else
+                                    {
+                                        // other statuses treat as warning and proceed to attempt create
+                                        var got = await getResp.Content.ReadAsStringAsync(stoppingToken);
+                                        _logger.LogWarning("External GetOrder returned status {Status} for order {Order}. Response: {Resp}", getResp.StatusCode, productionOrderInt, got);
+                                    }
+                                }
+                                catch (Exception ex)
+                                {
+                                    _logger.LogWarning(ex, "Failed to call external GetOrder for order {Order}. Proceeding to attempt create.", productionOrderInt);
+                                }
+                            }
+
+                            try
+                            {
+                                if (!skipSendBecauseExists)
+                                {
+                                 response = await client.PostAsync(externalEndpoint, content, stoppingToken);
+                                 if (response.IsSuccessStatusCode)
+                                 {
+                                     // Read response body to detect logical errors even when HTTP 200
+                                     var respText = await response.Content.ReadAsStringAsync(stoppingToken);
+                                     if (!string.IsNullOrWhiteSpace(respText))
+                                     {
+                                         try
+                                         {
+                                             using var doc = JsonDocument.Parse(respText);
+                                             if (doc.RootElement.TryGetProperty("result", out var resultEl) && resultEl.GetString() == "ERROR")
+                                             {
+                                                 // Extract messages array if present and persist as errorMsg
+                                                 if (doc.RootElement.TryGetProperty("messages", out var messagesEl) && messagesEl.ValueKind == JsonValueKind.Array)
+                                                 {
+                                                     var msgs = new List<string>();
+                                                     foreach (var m in messagesEl.EnumerateArray())
+                                                     {
+                                                         if (m.ValueKind == JsonValueKind.String)
+                                                         {
+                                                             var t = m.GetString();
+                                                             if (!string.IsNullOrWhiteSpace(t)) msgs.Add(t.Trim());
+                                                         }
+                                                     }
+
+                                                     if (msgs.Count > 0)
+                                                     {
+                                                         errorMsg = string.Join(" | ", msgs);
+                                                         sendSuccess = false;
+                                                         _logger.LogWarning("External API returned logical ERROR for order {Order}: {ErrorMsg}", productionOrderStr, errorMsg);
+                                                     }
+                                                     else
+                                                     {
+                                                         // No messages array content
+                                                         errorMsg = respText;
+                                                         sendSuccess = false;
+                                                         _logger.LogWarning("External API returned logical ERROR for order {Order}. Response: {Response}", productionOrderStr, respText);
+                                                     }
+                                                 }
+                                                 else
+                                                 {
+                                                     // result==ERROR but no messages array
+                                                     errorMsg = respText;
+                                                     sendSuccess = false;
+                                                     _logger.LogWarning("External API returned logical ERROR for order {Order}. Response: {Response}", productionOrderStr, respText);
+                                                 }
+
+                                                 // do not treat as HTTP success for downstream
+                                             }
+                                             else
+                                             {
+                                                 sendSuccess = true;
+                                                 _logger.LogInformation("Successfully sent order {Order} (messageId={MessageId})", productionOrderStr, messageId);
+                                             }
+                                         }
+                                         catch (JsonException jex)
+                                         {
+                                             // Unable to parse JSON, treat as success but keep raw response if any
+                                             sendSuccess = true;
+                                             _logger.LogInformation(jex, "Sent order {Order} but failed to parse response JSON", productionOrderStr);
+                                         }
+                                     }
+                                     else
+                                     {
+                                         sendSuccess = true;
+                                         _logger.LogInformation("Successfully sent order {Order} (messageId={MessageId})", productionOrderStr, messageId);
+                                     }
+                                 }
+                                 else
+                                 {
+                                     var respText = await response.Content.ReadAsStringAsync(stoppingToken);
+                                     errorMsg = respText;
+                                     _logger.LogError("Failed to send order {Order}. StatusCode: {StatusCode}. Response: {Response}", productionOrderStr, response.StatusCode, respText);
+                                 }
                                 }
                                 else
                                 {
-                                    var respText = await response.Content.ReadAsStringAsync(stoppingToken);
-                                    errorMsg = respText;
-                                    _logger.LogError("Failed to send order {Order}. StatusCode: {StatusCode}. Response: {Response}", productionOrderStr, response.StatusCode, respText);
+                                    // skip send because already exists remotely
+                                    _logger.LogInformation("Skipping CreateOrder POST because order exists remotely: {Order}", productionOrderInt);
                                 }
-                            }
-                            catch (Exception ex)
-                            {
-                                errorMsg = ex.ToString();
-                                _logger.LogError(ex, "Exception while sending order {Order}", productionOrderStr);
-                            }
-                            finally
-                            {
-                                response?.Dispose();
-                            }
+                             }
+                             catch (Exception ex)
+                             {
+                                 errorMsg = ex.ToString();
+                                 _logger.LogError(ex, "Exception while sending order {Order}", productionOrderStr);
+                             }
+                             finally
+                             {
+                                 response?.Dispose();
+                             }
 
                             // Write RECURRING_SERVICE_SEND log per order and update status SP accordingly
                             try
@@ -270,7 +322,7 @@ namespace BackendV2.Services
                             {
                                 if (productionOrderInt > 0)
                                 {
-                                    var newStatus = sendSuccess ? 900 : 200;
+                                    var newStatus = skipSendBecauseExists ? 201 : (sendSuccess ? 900 : 200);
                                     await using var updConn = new SqlConnection(cs);
                                     await using var updCmd = new SqlCommand("CSP_ZANCANER_ORDERS_UPDATE_STATUS_BY_ORDER", updConn) { CommandType = CommandType.StoredProcedure };
                                     updCmd.Parameters.AddWithValue("@NEW_STATUS", newStatus);

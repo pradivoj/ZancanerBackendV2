@@ -41,6 +41,7 @@ namespace BackendV2.Controllers
 
             var ordenes = new List<Orden>();
 
+
             try
             {
                 await using var conn = new SqlConnection(connectionString);
@@ -61,6 +62,7 @@ namespace BackendV2.Controllers
                         CreateDateTime = reader["CreateDateTime"] != DBNull.Value ? Convert.ToDateTime(reader["CreateDateTime"]) : DateTime.UtcNow,
                         LastModificatorUser = reader["LastModificatorUser"] != DBNull.Value ? Convert.ToInt32(reader["LastModificatorUser"]) : 0,
                         ModificationDatetime = reader["ModificationDatetime"] != DBNull.Value ? Convert.ToDateTime(reader["ModificationDatetime"]) : DateTime.UtcNow,
+                        StatusId = reader["STATUS_ID"] != DBNull.Value ? Convert.ToInt32(reader["STATUS_ID"]) : 0,
                         STATUS = reader["STATUS"]?.ToString() ?? string.Empty
                     };
 
@@ -153,6 +155,57 @@ namespace BackendV2.Controllers
 
             // Generate correlation id server-side
             var correlation = Guid.NewGuid();
+
+            // Check external system: ensure order does not already exist remotely
+            try
+            {
+                if (dto.ORDER.HasValue)
+                {
+                    var client = _httpClientFactory.CreateClient();
+                    var getEndpoint = $"http://93.41.138.207:88/ZncWebApi/ProductionOrder/GetOrder/{dto.ORDER.Value}";
+                    try
+                    {
+                        var getResp = await client.GetAsync(getEndpoint);
+                        if (getResp.IsSuccessStatusCode)
+                        {
+                            // Remote order exists -> abort
+                            // Try to mark local order status to 201
+                            try
+                            {
+                                await using var updConn = new SqlConnection(cs);
+                                await using var updCmd = new SqlCommand("CSP_ZANCANER_ORDERS_UPDATE_STATUS_BY_ORDER", updConn) { CommandType = CommandType.StoredProcedure };
+                                updCmd.Parameters.AddWithValue("@NEW_STATUS", 201);
+                                updCmd.Parameters.AddWithValue("@ORDER", dto.ORDER.Value);
+                                await updConn.OpenAsync();
+                                await updCmd.ExecuteNonQueryAsync();
+                            }
+                            catch (Exception updEx)
+                            {
+                                _logger.LogWarning(updEx, "Failed to update local status to 201 for order {Order}", dto.ORDER.Value);
+                            }
+
+                            return BadRequest("La order que desea crear ya existe en el ambiente de Zancaner");
+                        }
+                        else if (getResp.StatusCode == System.Net.HttpStatusCode.NotFound)
+                        {
+                            // not found -> proceed
+                        }
+                        else
+                        {
+                            var body = await getResp.Content.ReadAsStringAsync();
+                            _logger.LogWarning("GetOrder returned {Status} for order {Order}. Response: {Resp}", getResp.StatusCode, dto.ORDER.Value, body);
+                        }
+                    }
+                    catch (Exception exGet)
+                    {
+                        _logger.LogWarning(exGet, "Failed to call external GetOrder for order {Order}. Proceeding to create locally.", dto.ORDER.Value);
+                    }
+                }
+            }
+            catch (Exception exCheck)
+            {
+                _logger.LogWarning(exCheck, "Unexpected error while verifying external order existence");
+            }
 
             try
             {
