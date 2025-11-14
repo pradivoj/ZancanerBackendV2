@@ -194,5 +194,21 @@
       }
     ],
     "ReturnTypes": []
+  },
+  {
+    "ContainingType": "BackendV2.Controllers.OrdenesController",
+    "Method": "ValidaDatosOrden",
+    "RelativePath": "api/Ordenes/validadatosorden/{NroOrden}",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "NroOrden",
+        "Type": "System.Int32",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": []
   }
 ]

@@ -782,5 +782,98 @@ namespace BackendV2.Controllers
                 return StatusCode(500, $"Error starting order: {ex.Message}");
             }
         }
+
+        // New endpoint: ValidaDatosOrden - validates production order data via stored procedure and logs result
+        [HttpGet("validadatosorden/{NroOrden}")]
+        public async Task<IActionResult> ValidaDatosOrden(int NroOrden)
+        {
+            var cs = _configuration.GetConnectionString("DefaultConnection");
+            if (string.IsNullOrWhiteSpace(cs))
+            {
+                _logger.LogWarning("DefaultConnection not configured.");
+                return StatusCode(500, "Connection string not configured.");
+            }
+
+            try
+            {
+                int hasErrors = 0;
+                string errorMsg = string.Empty;
+
+                await using (var conn = new SqlConnection(cs))
+                await using (var cmd = new SqlCommand("CSP_ZANCANER_ORDERS_VALIDA_DATOS_ORDEN_BY_ORDER", conn) { CommandType = CommandType.StoredProcedure })
+                {
+                    cmd.Parameters.AddWithValue("@ORDER", NroOrden);
+
+                    await conn.OpenAsync();
+
+                    // Assume SP returns a result set with HAS_ERRORS and ERROR_MSG columns
+                    await using var reader = await cmd.ExecuteReaderAsync();
+                    if (await reader.ReadAsync())
+                    {
+                        // Robustly inspect returned columns to find HAS_ERRORS and ERROR_MSG (case-insensitive, different names)
+                        for (int i = 0; i < reader.FieldCount; i++)
+                        {
+                            var colName = reader.GetName(i) ?? string.Empty;
+                            var lower = colName.ToLowerInvariant();
+                            object? val = reader.IsDBNull(i) ? null : reader.GetValue(i);
+
+                            try
+                            {
+                                if (lower.Contains("has_errors") || lower.Contains("haserrors") || lower == "has_errors" || lower == "haserrors")
+                                {
+                                    if (val != null)
+                                    {
+                                        // Convert to int in a few possible boxed types
+                                        try
+                                        {
+                                            hasErrors = Convert.ToInt32(val);
+                                        }
+                                        catch (Exception exConv)
+                                        {
+                                            _logger.LogWarning(exConv, "Unable to convert HAS_ERRORS value '{Val}' to int for order {Order}", val, NroOrden);
+                                        }
+                                    }
+                                }
+
+                                if (lower.Contains("error_msg") || lower.Contains("errormsg") || lower.Contains("error") )
+                                {
+                                    if (val != null)
+                                    {
+                                        errorMsg = val.ToString() ?? string.Empty;
+                                    }
+                                }
+                            }
+                            catch (Exception exCol)
+                            {
+                                _logger.LogWarning(exCol, "Error reading column {Col} from validation SP for order {Order}", colName, NroOrden);
+                            }
+                        }
+                    }
+                    else
+                    {
+                        _logger.LogInformation("CSP_ZANCANER_ORDERS_VALIDA_DATOS_ORDEN_BY_ORDER returned no rows for order {Order}", NroOrden);
+                    }
+                }
+
+                // Write to bitacora: always record action and params; include errorMsg if hasErrors == 1
+                try
+                {
+                    var correlation = Guid.NewGuid();
+                    var paramText = $"Production_Order={NroOrden}";
+                    await _dbLog.LogAsync(0, "CSP_ZANCANER_ORDERS_VALIDA_DATOS_ORDEN_BY_ORDER", paramText, correlation, hasErrors == 1 ? errorMsg ?? string.Empty : string.Empty);
+                }
+                catch (Exception logEx)
+                {
+                    _logger.LogWarning(logEx, "Failed to write validation result to DB bitacora for order {Order}", NroOrden);
+                }
+
+                return Ok(new { hasErrors = hasErrors == 1, errorMsg });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error validating order data for {Order}", NroOrden);
+                return StatusCode(500, $"Error validating order data: {ex.Message}");
+            }
+        }
     }
 }
