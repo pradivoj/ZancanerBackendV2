@@ -273,7 +273,7 @@
         }
       }
     },
-    "/api/Ordenes/start/{productionOrder}/{slitter}": {
+    "/api/Ordenes/start/{productionOrder}/{slitter}/{userId}": {
       "post": {
         "tags": [
           "Ordenes"
@@ -290,6 +290,15 @@
           },
           {
             "name": "slitter",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          },
+          {
+            "name": "userId",
             "in": "path",
             "required": true,
             "schema": {
@@ -313,6 +322,47 @@
         "parameters": [
           {
             "name": "NroOrden",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/api/Ordenes/stop/{productionOrder}/{slitter}/{userId}": {
+      "post": {
+        "tags": [
+          "Ordenes"
+        ],
+        "parameters": [
+          {
+            "name": "productionOrder",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          },
+          {
+            "name": "slitter",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          },
+          {
+            "name": "userId",
             "in": "path",
             "required": true,
             "schema": {

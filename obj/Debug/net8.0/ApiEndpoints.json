@@ -151,7 +151,7 @@
   {
     "ContainingType": "BackendV2.Controllers.OrdenesController",
     "Method": "StartOrder",
-    "RelativePath": "api/Ordenes/start/{productionOrder}/{slitter}",
+    "RelativePath": "api/Ordenes/start/{productionOrder}/{slitter}/{userId}",
     "HttpMethod": "POST",
     "IsController": true,
     "Order": 0,
@@ -163,6 +163,37 @@
       },
       {
         "Name": "slitter",
+        "Type": "System.Int32",
+        "IsRequired": true
+      },
+      {
+        "Name": "userId",
+        "Type": "System.Int32",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "BackendV2.Controllers.OrdenesController",
+    "Method": "StopOrder",
+    "RelativePath": "api/Ordenes/stop/{productionOrder}/{slitter}/{userId}",
+    "HttpMethod": "POST",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "productionOrder",
+        "Type": "System.Int32",
+        "IsRequired": true
+      },
+      {
+        "Name": "slitter",
+        "Type": "System.Int32",
+        "IsRequired": true
+      },
+      {
+        "Name": "userId",
         "Type": "System.Int32",
         "IsRequired": true
       }

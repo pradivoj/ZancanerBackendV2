@@ -573,8 +573,8 @@ namespace BackendV2.Controllers
         }
 
         // POST -> Start order: prepares data, validates, calls external StartOrder and updates status
-        [HttpPost("start/{productionOrder}/{slitter}")]
-        public async Task<IActionResult> StartOrder(int productionOrder, int slitter)
+        [HttpPost("start/{productionOrder}/{slitter}/{userId}")]
+        public async Task<IActionResult> StartOrder(int productionOrder, int slitter, int userId)
         {
             var cs = _configuration.GetConnectionString("DefaultConnection");
             if (string.IsNullOrWhiteSpace(cs)) return StatusCode(500, "Connection string not configured.");
@@ -764,10 +764,10 @@ namespace BackendV2.Controllers
                     return StatusCode(500, $"Failed to update order status after external StartOrder: {ex.Message}");
                 }
 
-                // Log success in bitácora
+                // Log success in bitácora (use provided userId)
                 try
                 {
-                    await _dbLog.LogAsync(0, "START_ORDER", $"Production_Order={productionOrder};Slitter={slitter}", Guid.TryParse(messageId, out var g) ? g : Guid.NewGuid(), string.Empty);
+                    await _dbLog.LogAsync(userId, "START_ORDER", $"Production_Order={productionOrder};Slitter={slitter}", Guid.TryParse(messageId, out var g) ? g : Guid.NewGuid(), string.Empty);
                 }
                 catch (Exception logEx)
                 {
@@ -798,6 +798,7 @@ namespace BackendV2.Controllers
             {
                 int hasErrors = 0;
                 string errorMsg = string.Empty;
+                bool statusRefreshed = false;
 
                 await using (var conn = new SqlConnection(cs))
                 await using (var cmd = new SqlCommand("CSP_ZANCANER_ORDERS_VALIDA_DATOS_ORDEN_BY_ORDER", conn) { CommandType = CommandType.StoredProcedure })
@@ -842,6 +843,24 @@ namespace BackendV2.Controllers
                                         errorMsg = val.ToString() ?? string.Empty;
                                     }
                                 }
+
+                                // New column: STATUS_REFRESHED (bit)
+                                if (lower.Contains("status_refreshed") || lower.Contains("statusrefreshed") || lower == "status_refreshed" || lower == "statusrefreshed")
+                                {
+                                    if (val != null)
+                                    {
+                                        try
+                                        {
+                                            // handle common SQL bit representations
+                                            if (val is bool b) statusRefreshed = b;
+                                            else statusRefreshed = Convert.ToInt32(val) != 0;
+                                        }
+                                        catch (Exception exConv)
+                                        {
+                                            _logger.LogWarning(exConv, "Unable to convert STATUS_REFRESHED value '{Val}' to bool for order {Order}", val, NroOrden);
+                                        }
+                                    }
+                                }
                             }
                             catch (Exception exCol)
                             {
@@ -859,7 +878,7 @@ namespace BackendV2.Controllers
                 try
                 {
                     var correlation = Guid.NewGuid();
-                    var paramText = $"Production_Order={NroOrden}";
+                    var paramText = $"Production_Order={NroOrden};StatusRefreshed={statusRefreshed}";
                     await _dbLog.LogAsync(0, "CSP_ZANCANER_ORDERS_VALIDA_DATOS_ORDEN_BY_ORDER", paramText, correlation, hasErrors == 1 ? errorMsg ?? string.Empty : string.Empty);
                 }
                 catch (Exception logEx)
@@ -867,12 +886,333 @@ namespace BackendV2.Controllers
                     _logger.LogWarning(logEx, "Failed to write validation result to DB bitacora for order {Order}", NroOrden);
                 }
 
-                return Ok(new { hasErrors = hasErrors == 1, errorMsg });
+                return Ok(new { hasErrors = hasErrors == 1, errorMsg, statusRefreshed });
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Error validating order data for {Order}", NroOrden);
                 return StatusCode(500, $"Error validating order data: {ex.Message}");
+            }
+        }
+
+        // POST -> Stop order: calls external StopOrder, then local stop SP and updates status
+        [HttpPost("stop/{productionOrder}/{slitter}/{userId}")]
+        public async Task<IActionResult> StopOrder(int productionOrder, int slitter, int userId)
+        {
+            var cs = _configuration.GetConnectionString("DefaultConnection");
+            if (string.IsNullOrWhiteSpace(cs)) return StatusCode(500, "Connection string not configured.");
+
+            string? messageId = null;
+
+            try
+            {
+                // 1) Ensure order exists and try to extract correlation/messageId from DB
+                await using (var conn = new SqlConnection(cs))
+                await using (var cmd = new SqlCommand("CSP_ZANCANER_ORDERS_GET_BY_ID", conn) { CommandType = CommandType.StoredProcedure })
+                {
+                    cmd.Parameters.AddWithValue("@ORDER", productionOrder);
+                    await conn.OpenAsync();
+                    await using var reader = await cmd.ExecuteReaderAsync();
+                    if (!await reader.ReadAsync())
+                    {
+                        return NotFound("Error, la orden a detener no existe");
+                    }
+
+                    // Try to find correlation/messageId column
+                    for (int i = 0; i < reader.FieldCount; i++)
+                    {
+                        var colName = reader.GetName(i)?.ToLowerInvariant() ?? string.Empty;
+                        if (colName.Contains("correl") || colName.Contains("messageid") || colName.Contains("message_id") || colName.Contains("message"))
+                        {
+                            var val = reader.IsDBNull(i) ? null : reader.GetValue(i)?.ToString();
+                            if (!string.IsNullOrWhiteSpace(val))
+                            {
+                                messageId = val;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if (string.IsNullOrWhiteSpace(messageId)) messageId = Guid.NewGuid().ToString();
+
+                // 2) Call external StopOrder API
+                var payload = new
+                {
+                    messageType = "STOP_ORDER",
+                    messageId = messageId,
+                    productionOrder = productionOrder.ToString(),
+                    slitter = slitter
+                };
+
+                var json = JsonSerializer.Serialize(payload);
+                var client = _httpClientFactory.CreateClient();
+                var request = new HttpRequestMessage(HttpMethod.Post, "http://93.41.138.207:88/ZncWebApi/ProductionOrder/StopOrder")
+                {
+                    Content = new StringContent(json, Encoding.UTF8, "application/json")
+                };
+                request.Headers.Accept.Clear();
+                request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+
+                HttpResponseMessage? response = null;
+                try
+                {
+                    response = await client.SendAsync(request);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error calling external StopOrder API for order {Order}", productionOrder);
+                    try
+                    {
+                        await _dbLog.LogAsync(userId, "STOP_ORDER_EXTERNAL", $"Production_Order={productionOrder}", Guid.TryParse(messageId, out var g) ? g : Guid.NewGuid(), ex.ToString());
+                    }
+                    catch (Exception logEx)
+                    {
+                        _logger.LogWarning(logEx, "Failed to write STOP_ORDER_EXTERNAL error to DB bitacora for order {Order}", productionOrder);
+                    }
+
+                    return StatusCode(502, $"Failed to call external StopOrder API: {ex.Message}");
+                }
+
+                using (response)
+                {
+                    var respText = await response.Content.ReadAsStringAsync();
+
+                    if (response.StatusCode == System.Net.HttpStatusCode.NotFound)
+                    {
+                        // parse messages array if present
+                        string errorMsg = respText;
+                        try
+                        {
+                            using var parsedDocNotFound = JsonDocument.Parse(respText);
+                            if (parsedDocNotFound.RootElement.TryGetProperty("messages", out var messagesEl) && messagesEl.ValueKind == JsonValueKind.Array)
+                            {
+                                var msgs = new List<string>();
+                                foreach (var m in messagesEl.EnumerateArray())
+                                {
+                                    if (m.ValueKind == JsonValueKind.String)
+                                    {
+                                        var t = m.GetString();
+                                        if (!string.IsNullOrWhiteSpace(t)) msgs.Add(t.Trim());
+                                    }
+                                }
+
+                                if (msgs.Count > 0) errorMsg = string.Join(" | ", msgs);
+
+                                // If any message contains 'ERROR =>' prefix it with 'ZANCANER '
+                                for (int i = 0; i < msgs.Count; i++)
+                                {
+                                    var single = msgs[i];
+                                    if (!string.IsNullOrWhiteSpace(single) && single.IndexOf("ERROR =>", StringComparison.OrdinalIgnoreCase) >= 0)
+                                    {
+                                        msgs[i] = "ZANCANER " + single;
+                                        errorMsg = string.Join(" | ", msgs);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        catch
+                        {
+                            // ignore parse errors, keep raw text
+                        }
+
+                        // log to bitacora: attempted stop but not found
+                        try
+                        {
+                            await _dbLog.LogAsync(userId, "STOP_ORDER_EXTERNAL", $"Production_Order={productionOrder}", Guid.TryParse(messageId, out var g) ? g : Guid.NewGuid(), errorMsg);
+                        }
+                        catch (Exception logEx)
+                        {
+                            _logger.LogWarning(logEx, "Failed to write STOP_ORDER_EXTERNAL (not found) to DB bitacora for order {Order}", productionOrder);
+                        }
+
+                        return NotFound(errorMsg);
+                    }
+
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        // unexpected non-success
+                        try
+                        {
+                            await _dbLog.LogAsync(userId, "STOP_ORDER_EXTERNAL", $"Production_Order={productionOrder}", Guid.TryParse(messageId, out var g) ? g : Guid.NewGuid(), respText);
+                        }
+                        catch (Exception logEx)
+                        {
+                            _logger.LogWarning(logEx, "Failed to write STOP_ORDER_EXTERNAL failure to DB bitacora for order {Order}", productionOrder);
+                        }
+
+                        return StatusCode(502, $"External StopOrder failed: {response.StatusCode}");
+                    }
+
+                    // success (200) - parse body for messages
+                    try
+                    {
+                        using var parsedDocSuccess = JsonDocument.Parse(respText);
+                        if (parsedDocSuccess.RootElement.TryGetProperty("result", out var resultEl) && resultEl.GetString() == "OK")
+                        {
+                            string externalInfo = string.Empty;
+                            if (parsedDocSuccess.RootElement.TryGetProperty("messages", out var messagesEl) && messagesEl.ValueKind == JsonValueKind.Array)
+                            {
+                                var msgs = new List<string>();
+                                foreach (var m in messagesEl.EnumerateArray())
+                                {
+                                    if (m.ValueKind == JsonValueKind.String)
+                                    {
+                                        var t = m.GetString();
+                                        if (!string.IsNullOrWhiteSpace(t)) msgs.Add(t.Trim());
+                                    }
+                                }
+
+                                if (msgs.Count > 0) externalInfo = string.Join(" | ", msgs);
+                            }
+
+                            // record external success in bitacora
+                            try
+                            {
+                                await _dbLog.LogAsync(userId, "STOP_ORDER_EXTERNAL", $"Production_Order={productionOrder}", Guid.TryParse(messageId, out var g) ? g : Guid.NewGuid(), externalInfo ?? string.Empty);
+                            }
+                            catch (Exception logEx)
+                            {
+                                _logger.LogWarning(logEx, "Failed to write STOP_ORDER_EXTERNAL success to DB bitacora for order {Order}", productionOrder);
+                            }
+
+                            // 3) Call local SP CSP_ZANCANER_ORDERS_STOP_ORDER(@ORDER,@SLITTER,@USERID)
+                            var localStopSuccess = false;
+                            try
+                            {
+                                await using var conn2 = new SqlConnection(cs);
+                                await using var cmd2 = new SqlCommand("CSP_ZANCANER_ORDERS_STOP_ORDER", conn2) { CommandType = CommandType.StoredProcedure };
+                                cmd2.Parameters.AddWithValue("@ORDER", productionOrder);
+                                cmd2.Parameters.AddWithValue("@SLITTER", slitter);
+                                cmd2.Parameters.AddWithValue("@USERID", userId);
+
+                                await conn2.OpenAsync();
+                                await cmd2.ExecuteNonQueryAsync();
+
+                                localStopSuccess = true;
+
+                                // local stop success -> log
+                                try
+                                {
+                                    await _dbLog.LogAsync(userId, "STOP_ORDER_LOCAL", $"Production_Order={productionOrder}", Guid.TryParse(messageId, out var g) ? g : Guid.NewGuid(), string.Empty);
+                                }
+                                catch (Exception logEx)
+                                {
+                                    _logger.LogWarning(logEx, "Failed to write STOP_ORDER_LOCAL to DB bitacora for order {Order}", productionOrder);
+                                }
+                            }
+                            catch (Exception exLocal)
+                            {
+                                // log failure in bitacora with error message
+                                try
+                                {
+                                    await _dbLog.LogAsync(userId, "STOP_ORDER_LOCAL_FAILED", $"Production_Order={productionOrder}", Guid.TryParse(messageId, out var g) ? g : Guid.NewGuid(), exLocal.ToString());
+                                }
+                                catch (Exception logEx)
+                                {
+                                    _logger.LogWarning(logEx, "Failed to write STOP_ORDER_LOCAL_FAILED to DB bitacora for order {Order}", productionOrder);
+                                }
+
+                                // proceed to update status accordingly
+                            }
+
+                            // 4) Update status depending on local stop result: 930 on success, 920 on failure
+                            try
+                            {
+                                await using var updConn = new SqlConnection(cs);
+                                await using var updCmd = new SqlCommand("CSP_ZANCANER_ORDERS_UPDATE_STATUS_BY_ORDER", updConn) { CommandType = CommandType.StoredProcedure };
+                                var newStatus = localStopSuccess ? 930 : 920;
+                                updCmd.Parameters.AddWithValue("@NEW_STATUS", newStatus);
+                                updCmd.Parameters.AddWithValue("@ORDER", productionOrder);
+                                await updConn.OpenAsync();
+                                await updCmd.ExecuteNonQueryAsync();
+
+                                if (!localStopSuccess)
+                                {
+                                    // log that update corresponds to local stop failure
+                                    try
+                                    {
+                                        await _dbLog.LogAsync(userId, "STOP_ORDER_UPDATE_STATUS", $"Production_Order={productionOrder}", Guid.TryParse(messageId, out var g) ? g : Guid.NewGuid(), $"Updated status to {newStatus} due to local stop failure");
+                                    }
+                                    catch { }
+                                }
+                            }
+                            catch (Exception updEx)
+                            {
+                                _logger.LogError(updEx, "Failed to update status for order {Order}", productionOrder);
+                                try
+                                {
+                                    await _dbLog.LogAsync(userId, "STOP_ORDER_UPDATE_STATUS_FAILED", $"Production_Order={productionOrder}", Guid.TryParse(messageId, out var g) ? g : Guid.NewGuid(), updEx.ToString());
+                                }
+                                catch (Exception logEx)
+                                {
+                                    _logger.LogWarning(logEx, "Failed to write STOP_ORDER_UPDATE_STATUS_FAILED to DB bitacora for order {Order}", productionOrder);
+                                }
+
+                                return StatusCode(500, $"Failed to update order status: {updEx.Message}");
+                            }
+
+                            // final success log
+                            try
+                            {
+                                await _dbLog.LogAsync(userId, "STOP_ORDER_COMPLETE", $"Production_Order={productionOrder}", Guid.TryParse(messageId, out var g) ? g : Guid.NewGuid(), string.Empty);
+                            }
+                            catch (Exception logEx)
+                            {
+                                _logger.LogWarning(logEx, "Failed to write STOP_ORDER_COMPLETE to DB bitacora for order {Order}", productionOrder);
+                            }
+
+                            return NoContent();
+                        }
+                        else
+                        {
+                            // external returned 200 but not OK result
+                            var err = respText;
+                            try
+                            {
+                                using var parsedDocErr = JsonDocument.Parse(respText);
+                                if (parsedDocErr.RootElement.TryGetProperty("messages", out var messagesEl) && messagesEl.ValueKind == JsonValueKind.Array)
+                                {
+                                    var msgs = new List<string>();
+                                    foreach (var m in messagesEl.EnumerateArray()) if (m.ValueKind == JsonValueKind.String) msgs.Add(m.GetString() ?? string.Empty);
+                                    if (msgs.Count > 0) err = string.Join(" | ", msgs);
+                                }
+                            }
+                            catch { }
+
+                            try
+                            {
+                                await _dbLog.LogAsync(userId, "STOP_ORDER_EXTERNAL", $"Production_Order={productionOrder}", Guid.TryParse(messageId, out var g) ? g : Guid.NewGuid(), err);
+                            }
+                            catch (Exception logEx)
+                            {
+                                _logger.LogWarning(logEx, "Failed to write STOP_ORDER_EXTERNAL (non-OK) to DB bitacora for order {Order}", productionOrder);
+                            }
+
+                            return StatusCode(502, err);
+                        }
+                    }
+                    catch (JsonException jex)
+                    {
+                        _logger.LogWarning(jex, "Failed to parse external StopOrder response JSON for order {Order}", productionOrder);
+                        try
+                        {
+                            await _dbLog.LogAsync(userId, "STOP_ORDER_EXTERNAL", $"Production_Order={productionOrder}", Guid.TryParse(messageId, out var g) ? g : Guid.NewGuid(), respText);
+                        }
+                        catch (Exception logEx)
+                        {
+                            _logger.LogWarning(logEx, "Failed to write STOP_ORDER_EXTERNAL (raw) to DB bitacora for order {Order}", productionOrder);
+                        }
+
+                        return StatusCode(502, "Failed to parse external StopOrder response");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Unhandled error in StopOrder for order {Order}", productionOrder);
+                return StatusCode(500, $"Error stopping order: {ex.Message}");
             }
         }
     }
