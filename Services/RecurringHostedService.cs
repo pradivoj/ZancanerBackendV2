@@ -90,7 +90,6 @@ namespace BackendV2.Services
                         {
                             processedCount++;
 
-                            // Build single record payload from this row
                             var record = new Dictionary<string, object?>();
                             Guid? rowCorrelation = null;
                             string? productionOrderStr = null;
@@ -101,21 +100,27 @@ namespace BackendV2.Services
                                 var name = reader.GetName(i);
                                 var val = reader.IsDBNull(i) ? null : reader.GetValue(i);
 
-                                if (string.Equals(name, "CorrelationId", StringComparison.OrdinalIgnoreCase) && val != null)
+                                // Handle special columns
+                                if (string.Equals(name, "CorrelationId", StringComparison.OrdinalIgnoreCase))
                                 {
-                                    if (Guid.TryParse(val.ToString(), out var g)) rowCorrelation = g;
-                                    continue;
+                                    if (val != null && Guid.TryParse(val.ToString(), out var g))
+                                    {
+                                        rowCorrelation = g;
+                                    }
+                                    continue; // Don't add CorrelationId to the record payload
                                 }
 
-                                if (string.Equals(name, "productionOrder", StringComparison.OrdinalIgnoreCase) || string.Equals(name, "ProductionOrder", StringComparison.OrdinalIgnoreCase))
+                                if (string.Equals(name, "productionOrder", StringComparison.OrdinalIgnoreCase))
                                 {
                                     productionOrderStr = val?.ToString();
-                                    record["productionOrder"] = productionOrderStr;
-                                    if (int.TryParse(productionOrderStr, out var ord)) productionOrderInt = ord;
-                                    continue;
+                                    if (int.TryParse(productionOrderStr, out var ord))
+                                    {
+                                        productionOrderInt = ord;
+                                    }
+                                    // Continue to add it to the record below
                                 }
 
-                                // use camelCase key
+                                // Add the column to the record dictionary with a camelCase key
                                 var camelKey = Char.ToLowerInvariant(name[0]) + name.Substring(1);
                                 record[camelKey] = val;
                             }
