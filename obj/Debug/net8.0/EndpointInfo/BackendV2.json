@@ -400,6 +400,37 @@
           }
         }
       }
+    },
+    "/api/Reels/events": {
+      "post": {
+        "tags": [
+          "Reels"
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateReelEventDto"
+              }
+            },
+            "text/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateReelEventDto"
+              }
+            },
+            "application/*+json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateReelEventDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -420,6 +451,63 @@
             "minimum": 50001,
             "type": "integer",
             "format": "int32"
+          }
+        },
+        "additionalProperties": false
+      },
+      "CreateReelEventDto": {
+        "required": [
+          "cantReelsEjeInf",
+          "cantReelsEjeSup",
+          "endLot",
+          "productionOrder",
+          "reelLength",
+          "reels",
+          "userID"
+        ],
+        "type": "object",
+        "properties": {
+          "messageId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "productionOrder": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "userID": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "cantReelsEjeSup": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "cantReelsEjeInf": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "reelLength": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "endLot": {
+            "type": "boolean"
+          },
+          "deleted": {
+            "type": "boolean"
+          },
+          "deletedTimestamp": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "reels": {
+            "minItems": 1,
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReelEventDetailDto"
+            }
           }
         },
         "additionalProperties": false
@@ -458,6 +546,43 @@
           "status": {
             "type": "string",
             "nullable": true
+          }
+        },
+        "additionalProperties": false
+      },
+      "ReelEventDetailDto": {
+        "required": [
+          "edgeTrim",
+          "eje",
+          "manualExit",
+          "messageId",
+          "pos",
+          "productCode"
+        ],
+        "type": "object",
+        "properties": {
+          "messageId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "eje": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "pos": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "productCode": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "manualExit": {
+            "type": "boolean"
+          },
+          "edgeTrim": {
+            "type": "integer",
+            "format": "int32"
           }
         },
         "additionalProperties": false

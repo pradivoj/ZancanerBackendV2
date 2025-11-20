@@ -257,5 +257,21 @@
       }
     ],
     "ReturnTypes": []
+  },
+  {
+    "ContainingType": "BackendV2.Controllers.ReelsController",
+    "Method": "CreateReelEvent",
+    "RelativePath": "api/Reels/events",
+    "HttpMethod": "POST",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "dto",
+        "Type": "BackendV2.DTOs.CreateReelEventDto",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": []
   }
 ]
